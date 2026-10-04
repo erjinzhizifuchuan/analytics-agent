@@ -1,0 +1,651 @@
+"""
+Tests for the secrets-to-credentials Step 1 wire format:
+  - PUT /connections/{name} with {config, secrets}
+  - PUT /connections/{name} with legacy {fields}
+  - POST /connections with {config, secrets}
+  - _upsert_env_vars round-trips for tricky values
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import orjson
+import pytest
+from analytics_agent.api.settings import (
+    CreateConnectionRequest,
+    McpConfigRequest,
+    UpdateConnectionRequest,
+    _resolve_secrets,
+    _upsert_env_vars,
+    create_connection,
+    list_connections,
+    update_connection,
+)
+from fastapi import HTTPException
+
+# ---------------------------------------------------------------------------
+# McpConfigRequest transport validation
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_config_request_accepts_streamable_http() -> None:
+    cfg = McpConfigRequest(transport="streamable_http", url="https://mcp.example.com/mcp")
+    assert cfg.transport == "streamable_http"
+
+
+def test_mcp_config_request_accepts_sse() -> None:
+    cfg = McpConfigRequest(transport="sse", url="https://mcp.example.com/sse")
+    assert cfg.transport == "sse"
+
+
+def test_mcp_config_request_rejects_unknown_transport() -> None:
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        McpConfigRequest(transport="unknown")
+
+
+# ---------------------------------------------------------------------------
+# _upsert_env_vars round-trip tests
+# ---------------------------------------------------------------------------
+
+
+def _read_env(p: pathlib.Path) -> dict[str, str]:
+    """Parse a .env file into a plain dict, handling multiline double-quoted values."""
+    import re
+
+    result: dict[str, str] = {}
+    content = p.read_text()
+    # Match KEY="..." (possibly multiline) or KEY=bare-value
+    for m in re.finditer(
+        r'^([A-Za-z_][A-Za-z0-9_]*)=((?:"(?:\\.|[^"\\])*")|(?:[^\n]*))',
+        content,
+        re.MULTILINE | re.DOTALL,
+    ):
+        k = m.group(1)
+        v = m.group(2)
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        result[k] = v
+    return result
+
+
+def test_upsert_simple_value(tmp_path: pathlib.Path) -> None:
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"FOO": "bar"})
+    assert _read_env(env)["FOO"] == "bar"
+
+
+def test_upsert_always_quotes(tmp_path: pathlib.Path) -> None:
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"PLAIN": "simple"})
+    raw = env.read_text()
+    assert 'PLAIN="simple"' in raw
+
+
+def test_upsert_roundtrip_pem(tmp_path: pathlib.Path) -> None:
+    pem = "-----BEGIN RSA PRIVATE KEY-----\naGVsbG8K\n-----END RSA PRIVATE KEY-----"
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"SNOWFLAKE_PRIVATE_KEY": pem})
+    assert _read_env(env)["SNOWFLAKE_PRIVATE_KEY"] == pem
+
+
+def test_upsert_roundtrip_hash(tmp_path: pathlib.Path) -> None:
+    value = "pass#word"
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"SNOWFLAKE_PASSWORD": value})
+    assert _read_env(env)["SNOWFLAKE_PASSWORD"] == value
+
+
+def test_upsert_roundtrip_backslash(tmp_path: pathlib.Path) -> None:
+    value = r"C:\Users\me\key.p8"
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"KEY_PATH": value})
+    assert _read_env(env)["KEY_PATH"] == value
+
+
+def test_upsert_roundtrip_embedded_quote(tmp_path: pathlib.Path) -> None:
+    value = 'say "hello"'
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"GREETING": value})
+    assert _read_env(env)["GREETING"] == value
+
+
+def test_upsert_roundtrip_leading_trailing_whitespace(tmp_path: pathlib.Path) -> None:
+    value = "  spaced  "
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"PADDED": value})
+    assert _read_env(env)["PADDED"] == value
+
+
+def test_upsert_updates_existing_entry(tmp_path: pathlib.Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text('FOO="old"\n')
+    _upsert_env_vars(env, {"FOO": "new"})
+    lines = [line for line in env.read_text().splitlines() if line.startswith("FOO=")]
+    assert len(lines) == 1
+    assert _read_env(env)["FOO"] == "new"
+
+
+def test_upsert_updates_multiline_existing(tmp_path: pathlib.Path) -> None:
+    pem_old = "-----BEGIN RSA PRIVATE KEY-----\noldkey\n-----END RSA PRIVATE KEY-----"
+    pem_new = "-----BEGIN RSA PRIVATE KEY-----\nnewkey\n-----END RSA PRIVATE KEY-----"
+    env = tmp_path / ".env"
+    _upsert_env_vars(env, {"SNOWFLAKE_PRIVATE_KEY": pem_old})
+    _upsert_env_vars(env, {"SNOWFLAKE_PRIVATE_KEY": pem_new})
+    assert _read_env(env)["SNOWFLAKE_PRIVATE_KEY"] == pem_new
+
+
+# ---------------------------------------------------------------------------
+# _resolve_secrets (uses QueryEngine.secret_env_vars)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_secrets_snowflake_password() -> None:
+    result = _resolve_secrets("snowflake", {"password": "s3cr3t"})
+    assert result == {"SNOWFLAKE_PASSWORD": "s3cr3t"}
+
+
+def test_resolve_secrets_snowflake_private_key() -> None:
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+    result = _resolve_secrets("snowflake", {"private_key": pem})
+    assert result == {"SNOWFLAKE_PRIVATE_KEY": pem}
+
+
+def test_resolve_secrets_unknown_key_raises_400() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _resolve_secrets("snowflake", {"bad_key": "value"})
+    assert exc_info.value.status_code == 400
+    assert "bad_key" in exc_info.value.detail
+
+
+def test_resolve_secrets_unknown_engine_unknown_key_raises_400() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _resolve_secrets("duckdb", {"password": "x"})
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_secrets_skips_masked_values() -> None:
+    result = _resolve_secrets("snowflake", {"password": "•••••"})
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Integration-style tests via endpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_integration(name: str = "myconn", intg_type: str = "snowflake") -> MagicMock:
+    intg = MagicMock()
+    intg.name = name
+    intg.type = intg_type
+    intg.source = "ui"
+    intg.config = orjson.dumps({"account": "myorg-myacct", "warehouse": "WH"}).decode()
+    intg.updated_at = None
+    return intg
+
+
+# --- PUT with {config, secrets} (engine) ---
+
+
+@pytest.mark.asyncio
+async def test_put_config_and_secrets_writes_to_db_and_env(tmp_path: pathlib.Path) -> None:
+    intg = _make_integration()
+    session = AsyncMock()
+    session.commit = AsyncMock()
+    env_file = tmp_path / ".env"
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=intg)
+
+    body = UpdateConnectionRequest(
+        config={"warehouse": "NEW_WH", "role": "ANALYST"},
+        secrets={"password": "supersecret"},
+    )
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.engines.factory.register_engine"),
+        patch("analytics_agent.api.settings._find_env_file", return_value=env_file),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=False),
+    ):
+        result = await update_connection("myconn", body, session)
+
+    assert result["success"] is True
+    saved_cfg = orjson.loads(intg.config)
+    assert saved_cfg["warehouse"] == "NEW_WH"
+    assert saved_cfg["role"] == "ANALYST"
+    env_vars = _read_env(env_file)
+    assert env_vars["SNOWFLAKE_PASSWORD"] == "supersecret"
+
+
+@pytest.mark.asyncio
+async def test_put_config_only_no_env_file_touched(tmp_path: pathlib.Path) -> None:
+    """A config-only save must NOT create/modify .env."""
+    intg = _make_integration()
+    session = AsyncMock()
+    session.commit = AsyncMock()
+    env_file = tmp_path / ".env"
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=intg)
+
+    body = UpdateConnectionRequest(config={"warehouse": "ONLY_CFG"}, secrets={})
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.engines.factory.register_engine"),
+        patch("analytics_agent.api.settings._find_env_file", return_value=env_file),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=False),
+    ):
+        await update_connection("myconn", body, session)
+
+    assert orjson.loads(intg.config)["warehouse"] == "ONLY_CFG"
+    assert not env_file.exists()
+
+
+# --- PUT for context platform uses body.config ---
+
+
+@pytest.mark.asyncio
+async def test_put_context_platform_uses_body_config(tmp_path: pathlib.Path) -> None:
+    """DataHub (non-MCP) PUT: body.config keys merge into cp.config JSON."""
+    cp = MagicMock()
+    cp.type = "datahub"
+    cp.config = orjson.dumps(
+        {"type": "datahub", "name": "default", "url": "", "token": ""}
+    ).decode()
+    cp.updated_at = None
+
+    session = AsyncMock()
+    session.commit = AsyncMock()
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=cp)
+
+    body = UpdateConnectionRequest(
+        config={"url": "https://dh.example.com/gms", "token": "newtok"},
+        secrets={},
+    )
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=False),
+    ):
+        result = await update_connection("default", body, session)
+
+    assert result["success"] is True
+    saved = orjson.loads(cp.config)
+    assert saved["url"] == "https://dh.example.com/gms"
+    assert saved["token"] == "newtok"
+
+
+# --- Unknown secret key → HTTP 400 ---
+
+
+@pytest.mark.asyncio
+async def test_put_unknown_secret_key_raises_400(tmp_path: pathlib.Path) -> None:
+    intg = _make_integration()
+    session = AsyncMock()
+    session.commit = AsyncMock()
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=intg)
+
+    body = UpdateConnectionRequest(config={}, secrets={"totally_fake_key": "x"})
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await update_connection("myconn", body, session)
+    assert exc_info.value.status_code == 400
+    assert "totally_fake_key" in exc_info.value.detail
+
+
+# --- POST with {config, secrets} ---
+
+
+@pytest.mark.asyncio
+async def test_post_config_and_secrets(tmp_path: pathlib.Path) -> None:
+    session = AsyncMock()
+    session.commit = AsyncMock()
+    env_file = tmp_path / ".env"
+
+    persisted_config: dict = {}
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+
+    async def _fake_upsert(**kwargs: object) -> None:
+        persisted_config.update(orjson.loads(kwargs["config"]))  # type: ignore[arg-type]
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=None)
+    mock_intg_repo.upsert = _fake_upsert
+
+    body = CreateConnectionRequest(
+        name="newconn",
+        type="snowflake",
+        config={"account": "myorg-myacct", "warehouse": "WH", "user": "BOB"},
+        secrets={"password": "postpwd"},
+    )
+
+    with (
+        patch("analytics_agent.db.repository.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.engines.factory.register_engine"),
+        patch("analytics_agent.api.settings._find_env_file", return_value=env_file),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=False),
+    ):
+        result = await create_connection(body, session)
+
+    assert result["success"] is True
+    assert persisted_config.get("account") == "myorg-myacct"
+    env_vars = _read_env(env_file)
+    assert env_vars["SNOWFLAKE_PASSWORD"] == "postpwd"
+
+
+# ---------------------------------------------------------------------------
+# list_connections: spec-driven display_fields rendering
+# ---------------------------------------------------------------------------
+
+
+def _hive_integration(config: dict | None = None) -> MagicMock:
+    intg = MagicMock()
+    intg.name = "myhive"
+    intg.type = "hive"
+    intg.label = "My Hive"
+    intg.source = "ui"
+    intg.config = orjson.dumps(config or {}).decode()
+    intg.updated_at = None
+    return intg
+
+
+@pytest.mark.asyncio
+async def test_list_connections_hive_unconfigured_renders_all_fields() -> None:
+    """Hive with no config still shows all 7 plugin fields (closes #52)."""
+    intg = _hive_integration(config={})
+    session = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.list_all = AsyncMock(return_value=[intg])
+    mock_cred_repo = AsyncMock()
+    mock_cred_repo.get = AsyncMock(return_value=None)
+    mock_settings_repo = AsyncMock()
+
+    with (
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.db.repository.CredentialRepo", return_value=mock_cred_repo),
+        patch("analytics_agent.api.settings.SettingsRepo", return_value=mock_settings_repo),
+        patch(
+            "analytics_agent.api.settings._get_datahub_connections",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_tools",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_enabled_mutations",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_connections",
+            AsyncMock(return_value=set()),
+        ),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=True),
+    ):
+        conns = await list_connections(session)
+
+    hive = next(c for c in conns if c.type == "hive")
+    assert hive.status == "unconfigured"
+    field_keys = [f.key for f in hive.fields]
+    assert field_keys == [
+        "host",
+        "port",
+        "database",
+        "auth",
+        "user",
+        "password",
+        "kerberos_service_name",
+    ]
+    labels = {f.key: f.label for f in hive.fields}
+    assert labels["host"] == "Host"
+    assert labels["password"] == "Password"
+    # Sensitive password field is masked and routes through secret_key.
+    password = next(f for f in hive.fields if f.key == "password")
+    assert password.sensitive is True
+    assert password.secret_key == "password"
+    assert password.value == ""
+
+
+@pytest.mark.asyncio
+async def test_list_connections_hive_configured_masks_password_and_shows_values() -> None:
+    intg = _hive_integration(
+        config={
+            "host": "kyuubi.internal",
+            "port": "10000",
+            "database": "analytics",
+            "user": "svc",
+            "password": "super-secret",
+        }
+    )
+    session = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.list_all = AsyncMock(return_value=[intg])
+    mock_cred_repo = AsyncMock()
+    mock_cred_repo.get = AsyncMock(return_value=None)
+    mock_settings_repo = AsyncMock()
+
+    with (
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.db.repository.CredentialRepo", return_value=mock_cred_repo),
+        patch("analytics_agent.api.settings.SettingsRepo", return_value=mock_settings_repo),
+        patch(
+            "analytics_agent.api.settings._get_datahub_connections",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_tools",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_enabled_mutations",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_connections",
+            AsyncMock(return_value=set()),
+        ),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=True),
+    ):
+        conns = await list_connections(session)
+
+    hive = next(c for c in conns if c.type == "hive")
+    assert hive.status == "connected"
+    values = {f.key: f.value for f in hive.fields}
+    assert values["host"] == "kyuubi.internal"
+    assert values["port"] == "10000"
+    assert values["user"] == "svc"
+    # Password value is never sent verbatim; the placeholder string signals "set".
+    assert values["password"] == "(configured)"
+
+
+@pytest.mark.asyncio
+async def test_list_connections_hive_kerberos_is_configured() -> None:
+    """Kerberos-authenticated Hive (no user/password) must register as configured."""
+    intg = _hive_integration(
+        config={
+            "host": "kyuubi.internal",
+            "auth": "KERBEROS",
+            "kerberos_service_name": "hive",
+        }
+    )
+    session = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.list_all = AsyncMock(return_value=[intg])
+    mock_cred_repo = AsyncMock()
+    mock_cred_repo.get = AsyncMock(return_value=None)
+    mock_settings_repo = AsyncMock()
+
+    with (
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.db.repository.CredentialRepo", return_value=mock_cred_repo),
+        patch("analytics_agent.api.settings.SettingsRepo", return_value=mock_settings_repo),
+        patch(
+            "analytics_agent.api.settings._get_datahub_connections",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_tools",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_enabled_mutations",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_connections",
+            AsyncMock(return_value=set()),
+        ),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=True),
+    ):
+        conns = await list_connections(session)
+
+    hive = next(c for c in conns if c.type == "hive")
+    assert hive.status == "connected"
+
+
+@pytest.mark.asyncio
+async def test_list_connections_unknown_type_falls_through_to_empty() -> None:
+    """A type with no spec and no display_fields still gets handled gracefully."""
+    intg = MagicMock()
+    intg.name = "mystery"
+    intg.type = "totally-unknown-engine"
+    intg.label = "Mystery"
+    intg.source = "ui"
+    intg.config = orjson.dumps({"foo": "bar"}).decode()
+    intg.updated_at = None
+    session = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.list_all = AsyncMock(return_value=[intg])
+    mock_cred_repo = AsyncMock()
+    mock_cred_repo.get = AsyncMock(return_value=None)
+    mock_settings_repo = AsyncMock()
+
+    with (
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch("analytics_agent.db.repository.CredentialRepo", return_value=mock_cred_repo),
+        patch("analytics_agent.api.settings.SettingsRepo", return_value=mock_settings_repo),
+        patch(
+            "analytics_agent.api.settings._get_datahub_connections",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_tools",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_enabled_mutations",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
+            "analytics_agent.api.settings._get_disabled_connections",
+            AsyncMock(return_value=set()),
+        ),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=True),
+    ):
+        conns = await list_connections(session)
+
+    mystery = next(c for c in conns if c.type == "totally-unknown-engine")
+    assert mystery.status == "unconfigured"
+    assert mystery.fields == []
+
+
+# --- PUT on the synthesized "default" DataHub connection (#91) ---
+
+
+@pytest.mark.asyncio
+async def test_put_default_datahub_connection_creates_when_absent() -> None:
+    """Saving the pre-populated 'default' DataHub card must CREATE its row,
+    not 404, when no context_platform rows exist yet (#91)."""
+    session = AsyncMock()
+    session.commit = AsyncMock()
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+    mock_cp_repo.list_all = AsyncMock(return_value=[])  # synthesized default, unpersisted
+    mock_cp_repo.upsert = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=None)
+
+    body = UpdateConnectionRequest(
+        config={"url": "http://gms.example.com:8080", "token": "tok-123"}, secrets={}
+    )
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        patch.dict("analytics_agent.api.settings.os.environ", {}, clear=False),
+    ):
+        result = await update_connection("default", body, session)
+        # Credentials propagated to env for immediate effect (capture inside the
+        # patch.dict scope — it restores os.environ on exit).
+        env_url = os.environ.get("DATAHUB_GMS_URL")
+        env_token = os.environ.get("DATAHUB_GMS_TOKEN")
+
+    assert result["success"] is True
+    mock_cp_repo.upsert.assert_awaited_once()
+    kwargs = mock_cp_repo.upsert.await_args.kwargs
+    assert kwargs["type"] == "datahub"
+    assert kwargs["name"] == "default"
+    saved = orjson.loads(kwargs["config"])
+    assert saved["url"] == "http://gms.example.com:8080"
+    assert saved["token"] == "tok-123"
+    assert env_url == "http://gms.example.com:8080"
+    assert env_token == "tok-123"
+
+
+@pytest.mark.asyncio
+async def test_put_unknown_connection_still_404s() -> None:
+    """A genuinely unknown connection (not the synthesized default, no engine
+    row) must still 404 — the upsert path is scoped to 'default' only."""
+    session = AsyncMock()
+
+    mock_cp_repo = AsyncMock()
+    mock_cp_repo.get = AsyncMock(return_value=None)
+    mock_cp_repo.list_all = AsyncMock(return_value=[])
+    mock_cp_repo.upsert = AsyncMock()
+
+    mock_intg_repo = AsyncMock()
+    mock_intg_repo.get = AsyncMock(return_value=None)
+
+    body = UpdateConnectionRequest(config={"warehouse": "WH"}, secrets={})
+
+    with (
+        patch("analytics_agent.api.settings.ContextPlatformRepo", return_value=mock_cp_repo),
+        patch("analytics_agent.db.repository.IntegrationRepo", return_value=mock_intg_repo),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await update_connection("mystery-conn", body, session)
+
+    assert exc.value.status_code == 404
+    mock_cp_repo.upsert.assert_not_awaited()

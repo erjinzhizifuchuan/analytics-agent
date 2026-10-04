@@ -1,0 +1,449 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="frontend/public/analytics-agent-logo-dark-bg.svg">
+    <source media="(prefers-color-scheme: light)" srcset="frontend/public/analytics-agent-logo-color.svg">
+    <img alt="Analytics Agent" src="frontend/public/analytics-agent-logo-color.svg" width="220">
+  </picture>
+</p>
+
+<p align="center">
+  <strong>Natural-language data queries, powered by DataHub + LangGraph</strong><br>
+  Ask a question. Get SQL, results, and a chart — in one turn.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/LangGraph-0.2+-orange" alt="LangGraph">
+  <img src="https://img.shields.io/badge/React-18-61dafb?logo=react&logoColor=black" alt="React">
+  <img src="https://img.shields.io/badge/DataHub-context%20layer-0052cc" alt="DataHub">
+</p>
+
+<p align="center">
+  <img src="docs/screenshot-chat.png" alt="Analytics Agent chat with chart and context quality bar" width="900">
+</p>
+
+<p align="center">
+  <img src="docs/screenshot-welcome.png" alt="Analytics Agent welcome screen with conversation history" width="900">
+</p>
+
+Analytics Agent connects to your data warehouse and answers questions in plain English — writing SQL, running it, and rendering charts automatically. Connect it to [DataHub](https://datahub.com) and it gains real knowledge of your tables, columns, and business definitions, so it writes better SQL and can explain what it found in terms your team already uses. DataHub is optional — the agent works without it, just with less context.
+
+---
+
+## ⚡ Quickstart
+
+### Option A — pip / uvx (recommended, no Docker needed)
+
+> Requires Python 3.11+
+
+```bash
+# Install and launch — no git clone, no repo, no Docker
+pip install datahub-analytics-agent
+analytics-agent quickstart
+
+# Or with uv (no virtualenv management):
+uvx datahub-analytics-agent quickstart
+```
+
+This starts the server at **http://localhost:8100** and opens the browser, where a setup wizard walks you through choosing a model and entering your API key. Config and the database are stored in `~/.datahub/analytics-agent/`.
+
+Re-running `analytics-agent quickstart` restarts the server without any prompts. To re-open the setup wizard, use `analytics-agent quickstart --reconfigure`.
+
+**Other server commands:**
+
+```bash
+analytics-agent start    # start from existing config (no wizard)
+analytics-agent stop     # stop the running server
+analytics-agent status   # show whether server is running + URL
+analytics-agent logs     # tail ~/.datahub/analytics-agent/logs/agent.log
+analytics-agent config   # open config dir in $EDITOR or print its path
+```
+
+### Option B — Docker + sample data (full demo)
+
+> **Requires:** Docker, DataHub CLI (`pip install acryl-datahub`), `uv`, Python 3.11+
+
+```bash
+git clone https://github.com/datahub-project/analytics-agent.git
+cd analytics-agent
+bash quickstart.sh
+```
+
+The script starts a local DataHub instance, loads the Fiction Retail sample dataset and catalog metadata, then builds and launches Analytics Agent at **http://localhost:8100**. Postgres data is persisted to `~/.datahub/analytics-agent/postgres-data/` so it survives container restarts.
+
+**Using AWS Bedrock?** Export `LLM_PROVIDER=bedrock` before running the script. The script will verify your AWS credentials and Bedrock access before starting the container, and mount `~/.aws` read-only so boto3 picks up your profiles and SSO cache automatically.
+
+---
+
+## What it does
+
+| | |
+|---|---|
+| **Context Quality** | A live status bar scores how well your DataHub catalog supported the agent (1–5). Hover for the LLM's reasoning. The score improves as you document your data. |
+| **`/improve-context`** | Type `/improve-context` after any conversation to get a numbered list of documentation improvements the agent wishes it had — then approve and publish them to DataHub in one click. |
+| **Plain-English → SQL → Chart** | Ask "top 5 categories by revenue" — the agent writes SQL, runs it, and auto-renders a Vega-Lite chart, all in one turn. |
+| **Multi-turn memory** | Follow-ups like "make it a pie chart" or "filter to Q3" work across turns. |
+| **Collapsible reasoning** | Tool calls and agent thinking are shown but collapsed — visible when you want them, out of the way when you don't. |
+| **Multiple connections** | Add and manage Snowflake, BigQuery, PostgreSQL, MySQL, and other SQLAlchemy-compatible databases from Settings. Each has its own encrypted credentials. |
+| **Light and dark themes** | Four built-in themes with a switcher in the bottom-left corner. |
+
+---
+
+## Manual setup (for contributors / development)
+
+> This section is for hacking on the agent itself. For everyday use, `analytics-agent quickstart` is simpler.
+
+**Prerequisites:** [`uv`](https://docs.astral.sh/uv/getting-started/installation/), [`mise`](https://mise.jdx.dev/getting-started.html) (manages Node + pnpm), Python 3.11+
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/datahub-project/analytics-agent.git
+cd analytics-agent
+mise install       # installs Node 22 + pnpm (reads .mise.toml)
+make install       # uv sync + pnpm install
+make start         # builds frontend, starts backend at :8100
+```
+
+Open **http://localhost:8100** — a setup wizard handles the LLM key and connections on first run.
+
+> **Without `make`:** `uv sync && cd frontend && pnpm install && pnpm build && cd .. && uv run uvicorn analytics_agent.main:app --port 8100`
+
+### First-time setup
+
+Before the first `uvicorn` start (or after pulling a release that adds migrations), run:
+
+```bash
+uv run analytics-agent bootstrap
+```
+
+This applies Alembic migrations, seeds engines and context platforms from `config.yaml`, and writes first-run setting defaults. The command is idempotent — re-running it on an up-to-date database is a no-op.
+
+For Kubernetes deployments, the Helm chart runs `analytics-agent bootstrap` automatically as a `pre-install`/`pre-upgrade` hook (see `helm/analytics-agent/README.md`).
+
+### Optional: pre-configure via `.env`
+
+```bash
+cp .env.example .env   # then edit as needed
+```
+
+```bash
+# LLM — pick one provider (or leave blank and use the wizard)
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# DataHub (optional — can also be added via Settings → Connections)
+DATAHUB_GMS_URL=https://your-instance.acryl.io/gms
+DATAHUB_GMS_TOKEN=eyJhbGci...
+```
+
+### Useful make targets
+
+| Command | What it does |
+|---|---|
+| `make start` | Build frontend if stale, start backend |
+| `make start-remote` | Start + show DataHub connection status |
+| `make nuke` | Wipe the DB and start from scratch |
+| `make dev` | Hot-reload backend (use `make dev-full` for frontend HMR too) |
+| `make logs` | Tail backend logs |
+
+### Development mode (hot reload)
+
+```bash
+# Terminal 1 — backend (dev)
+uv run uvicorn analytics_agent.main:app --reload --port 8101
+
+# Terminal 2 — frontend HMR (http://localhost:5173, proxies /api/* to :8101)
+cd frontend && pnpm dev
+```
+
+---
+
+## Connect DataHub
+
+```bash
+# DataHub Cloud (Acryl)
+datahub init --sso --host https://your-instance.acryl.io/gms --token-duration ONE_MONTH
+
+# Self-hosted
+datahub init --host http://localhost:8080 --username datahub --password datahub
+
+# Verify the connection
+curl -s -X POST http://localhost:8100/api/settings/connections/datahub/test
+```
+
+---
+
+## Connect Snowflake
+
+### Option A — Service account via `config.yaml` (recommended)
+
+```yaml
+# config.yaml
+engines:
+  - type: snowflake
+    name: snowflake
+    connection:
+      account: "${SNOWFLAKE_ACCOUNT}"
+      warehouse: "${SNOWFLAKE_WAREHOUSE}"
+      database: "${SNOWFLAKE_DATABASE}"
+      schema: "${SNOWFLAKE_SCHEMA}"
+      user: "${SNOWFLAKE_USER}"
+```
+
+### Option B — Key-pair auth
+
+Generate an RSA key pair, upload the public key to Snowflake, then set `SNOWFLAKE_PRIVATE_KEY` (base64-encoded PEM) in `.env`.
+
+### Option C — Personal SSO (Settings UI)
+
+**Settings → Connections → Authentication → SSO** — opens a browser window for your IdP.
+
+---
+
+## Connect BigQuery
+
+BigQuery authenticates exclusively via a GCP **service account**. Three credential formats are supported — use whichever fits your deployment:
+
+### Option A — JSON key via environment variable (recommended for containers)
+
+Export the raw service-account JSON (single line, no newlines):
+
+```bash
+export BIGQUERY_CREDENTIALS_JSON='{"type":"service_account","project_id":"my-project",...}'
+```
+
+Or add it to `.env`:
+
+```bash
+BIGQUERY_CREDENTIALS_JSON={"type":"service_account","project_id":"my-project",...}
+```
+
+Then reference the project in `config.yaml`:
+
+```yaml
+# config.yaml
+engines:
+  - type: bigquery
+    name: prod
+    connection:
+      project: "${BIGQUERY_PROJECT}"
+      dataset: "${BIGQUERY_DATASET}"   # optional default dataset
+```
+
+### Option B — Base64-encoded JSON key via `config.yaml`
+
+Encode your key file once:
+
+```bash
+base64 -i my-service-account.json | tr -d '\n'
+```
+
+Then paste the output into `config.yaml`:
+
+```yaml
+engines:
+  - type: bigquery
+    name: prod
+    connection:
+      project: my-gcp-project
+      dataset: my_dataset          # optional
+      credentials_base64: "ey..."
+```
+
+### Option C — Path to a JSON key file
+
+Useful for local development or when the key file is mounted into the container:
+
+```yaml
+engines:
+  - type: bigquery
+    name: prod
+    connection:
+      project: my-gcp-project
+      credentials_path: /secrets/sa-key.json
+```
+
+### Required IAM roles
+
+The service account needs at minimum:
+
+| Role | Purpose |
+|---|---|
+| `roles/bigquery.dataViewer` | Read tables and schemas |
+| `roles/bigquery.jobUser` | Run queries |
+
+---
+
+## LLM providers
+
+Set `LLM_PROVIDER` to one of the values below, or use the **Settings → Model** wizard in the UI.
+
+| Provider | `LLM_PROVIDER` value | Auth |
+|---|---|---|
+| Anthropic (default) | `anthropic` | `ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| Google Gemini | `google` | `GOOGLE_API_KEY` |
+| AWS Bedrock | `bedrock` | AWS credential chain |
+| OpenAI-compatible proxy | `openai-compatible` | `OPENAI_COMPATIBLE_BASE_URL` + optional `OPENAI_COMPATIBLE_API_KEY` |
+
+<details>
+<summary><strong>Anthropic</strong></summary>
+
+```bash
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Default models: `claude-sonnet-4-6` (main), `claude-haiku-4-5-20251001` (chart/quality/delight).
+</details>
+
+<details>
+<summary><strong>OpenAI</strong></summary>
+
+```bash
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+```
+
+Default models: `gpt-4o` (main), `gpt-4o-mini` (chart/quality/delight).
+</details>
+
+<details>
+<summary><strong>Google Gemini</strong></summary>
+
+```bash
+LLM_PROVIDER=google
+GOOGLE_API_KEY=AIza...
+```
+
+Default models: `gemini-2.0-flash` (main), `gemini-1.5-flash` (chart/quality/delight).
+</details>
+
+<details>
+<summary><strong>AWS Bedrock</strong></summary>
+
+Runs Anthropic models via Bedrock. Auth falls back to the standard AWS credential chain (env vars, `~/.aws/credentials`, IAM role). Set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) to override. `AWS_REGION` defaults to `us-west-2`.
+
+```bash
+LLM_PROVIDER=bedrock
+AWS_REGION=us-west-2
+LLM_MODEL=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+```
+</details>
+
+<details>
+<summary><strong>OpenAI-compatible proxy</strong> (LiteLLM, vLLM, Ollama, …)</summary>
+
+Any proxy that speaks the OpenAI chat completions API (`/v1/chat/completions`) works — LiteLLM, vLLM, Ollama, Azure OpenAI custom endpoints, etc. No extra dependencies required.
+
+```bash
+LLM_PROVIDER=openai-compatible
+OPENAI_COMPATIBLE_BASE_URL=https://litellm.myorg.com/v1   # required
+OPENAI_COMPATIBLE_API_KEY=sk-...                           # optional — omit if proxy uses network-level auth
+LLM_MODEL=llama3.2                                     # model name as the proxy expects it
+```
+
+You can also configure the proxy URL and model through **Settings → Model** in the UI.
+</details>
+
+<details>
+<summary><strong>Model tiers</strong> — override individual tiers independently</summary>
+
+| Task | Env var | Purpose |
+|---|---|---|
+| Main analysis agent | `LLM_MODEL` | SQL generation, reasoning |
+| Chart generation | `CHART_LLM_MODEL` | Vega-Lite chart spec |
+| Context quality scoring | `QUALITY_LLM_MODEL` | 1–5 catalog quality score |
+| Titles & greeting | `DELIGHT_LLM_MODEL` | Short text generation |
+
+```bash
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-opus-4-7           # upgrade just the agent
+QUALITY_LLM_MODEL=claude-sonnet-4-6 # or use a stronger model for quality scoring
+```
+</details>
+
+
+---
+
+## Database
+
+The `analytics-agent quickstart` path uses SQLite at `~/.datahub/analytics-agent/data/agent.db`. The Docker quickstart uses Postgres, with data persisted to `~/.datahub/analytics-agent/postgres-data/`. For dev/Helm deployments, set `DATABASE_URL` explicitly — see `.env.example` for Postgres and SQLite formats.
+
+---
+
+## Settings UI
+
+**Settings** (top-right) manages:
+- **Connections** — test, edit, add, and delete engine connections
+- **Authentication** — per-connection: Password, Private Key, SSO, PAT, OAuth
+- **Tool toggles** — enable/disable individual DataHub or engine tools
+- **Write-back skills** — `publish_analysis` and `save_correction` (enabled by default)
+- **Prompt** — customize the system prompt
+- **Display** — app name and logo
+
+---
+
+## Production
+
+### Docker
+
+```bash
+docker build -f docker/Dockerfile -t analytics-agent .
+docker run -p 8100:8100 --env-file .env analytics-agent
+```
+
+### Single process (no Docker)
+
+```bash
+cd frontend && pnpm build && cd ..
+uv run uvicorn analytics_agent.main:app --host 0.0.0.0 --port 8100
+```
+
+---
+
+## Architecture
+<p align="center">
+  <img src="docs/analytics-agent.png" alt="DataHub architecture diagram" width="900">
+</p>
+
+```
+analytics-agent/
+├── backend/src/analytics_agent/
+│   ├── agent/          # LangGraph ReAct graph, streaming, chart generation, analysis
+│   ├── api/            # FastAPI routes: conversations, chat (SSE), settings, oauth
+│   ├── context/        # DataHub tool loader (datahub_agent_context)
+│   ├── db/             # SQLAlchemy models + Alembic migrations
+│   │   └── models.py   # Conversation, Message, Integration, Setting
+│   ├── engines/        # Pluggable query engines (Snowflake, BigQuery, SQLAlchemy-based)
+│   ├── prompts/        # System prompt (system_prompt.md) + chart prompt
+│   └── skills/         # Write-back skills: publish-analysis, save-correction,
+│                       #   improve-context (/improve-context slash command)
+└── frontend/src/
+    ├── components/Chat/ # MessageList, MessageInput, ContextStatusBar
+    ├── components/Settings/
+    ├── api/             # fetch wrappers for REST + SSE stream reader
+    └── store/           # Zustand: conversations, display, theme
+```
+
+**SSE event flow:**
+```
+User message → POST /api/conversations/{id}/messages
+  → resolver.py resolves credentials → configured engine
+  → LangGraph ReAct agent (DataHub tools + engine tools)
+  → astream_events → TEXT / TOOL_CALL / TOOL_RESULT / SQL / CHART / COMPLETE
+  → Frontend renders each event type inline
+  → Background: context quality scored async, stored on conversation row
+```
+
+---
+
+<p align="center">
+  <a href="https://datahub.com">
+    <img src="frontend/public/analytics-agent-logo-white.svg" alt="Powered by DataHub" width="80">
+  </a>
+  <br>
+  <sub>Built with <a href="https://datahub.com">DataHub</a> · <a href="https://langchain.com/langgraph">LangGraph</a> · <a href="https://fastapi.tiangolo.com">FastAPI</a> · <a href="https://react.dev">React</a></sub>
+</p>

@@ -1,0 +1,462 @@
+"""
+Tests for the LLM provider registry introduced in config.py and agent/llm.py.
+
+Covers:
+- PROVIDER_DEFAULTS structure (all providers × all tiers)
+- PROVIDER_KEY_ENV / PROVIDER_KEY_ATTR consistency
+- Settings model-tier methods (get_llm_model etc.) + env-var overrides
+- Settings.get_api_key() returns the right attribute per provider
+- agent/llm._make_llm() dispatches to the correct factory
+- agent/llm._make_llm() raises a clear error for unknown providers
+- Backward-compat env var aliases: OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from analytics_agent.agent.llm import _FACTORIES, _make_llm
+from analytics_agent.config import (
+    PROVIDER_DEFAULTS,
+    PROVIDER_KEY_ATTR,
+    PROVIDER_KEY_ENV,
+    Settings,
+)
+
+# ─── PROVIDER_DEFAULTS structure ─────────────────────────────────────────────
+
+EXPECTED_PROVIDERS = {"anthropic", "openai", "google", "bedrock", "openai-compatible"}
+# Providers that authenticate with a single API key (bedrock uses AWS creds instead).
+EXPECTED_API_KEY_PROVIDERS = {"anthropic", "openai", "google", "openai-compatible"}
+EXPECTED_TIERS = {"main", "chart", "quality", "delight"}
+# Providers whose default model IDs are intentionally empty (user must supply the model).
+PROVIDERS_WITH_EMPTY_DEFAULTS = {"openai-compatible"}
+
+
+def test_provider_defaults_has_all_providers():
+    assert set(PROVIDER_DEFAULTS) == EXPECTED_PROVIDERS
+
+
+def test_provider_defaults_all_tiers_present():
+    for provider, defaults in PROVIDER_DEFAULTS.items():
+        missing = EXPECTED_TIERS - set(defaults)
+        assert not missing, f"{provider} is missing tiers: {missing}"
+
+
+def test_provider_defaults_no_empty_values():
+    for provider, defaults in PROVIDER_DEFAULTS.items():
+        if provider in PROVIDERS_WITH_EMPTY_DEFAULTS:
+            continue  # these intentionally have empty defaults — user must supply the model
+        for tier, model in defaults.items():
+            assert model, f"{provider}[{tier}] is empty"
+
+
+def test_provider_key_env_covers_all_providers():
+    assert set(PROVIDER_KEY_ENV) == EXPECTED_API_KEY_PROVIDERS
+
+
+def test_provider_key_attr_covers_all_providers():
+    assert set(PROVIDER_KEY_ATTR) == EXPECTED_API_KEY_PROVIDERS
+
+
+def test_provider_key_env_and_attr_consistent():
+    """Every provider should appear in both lookup tables."""
+    assert set(PROVIDER_KEY_ENV) == set(PROVIDER_KEY_ATTR)
+
+
+# ─── Settings model-tier methods ─────────────────────────────────────────────
+
+
+def _settings(provider: str, **overrides) -> Settings:
+    return Settings(
+        llm_provider=provider,
+        database_url="sqlite+aiosqlite:///./test.db",
+        **overrides,
+    )
+
+
+# openai-compatible is excluded: its PROVIDER_DEFAULTS are intentionally empty ("") because
+# the user must supply a model. The _resolve_model fallback will return whatever
+# is in openai_compatible_model/llm_model — which varies per environment. The
+# openai-compatible fallback behaviour is covered by test_openai_compatible_* tests below.
+_PROVIDERS_WITH_CURATED_DEFAULTS = EXPECTED_PROVIDERS - PROVIDERS_WITH_EMPTY_DEFAULTS
+
+
+@pytest.mark.parametrize("provider", sorted(_PROVIDERS_WITH_CURATED_DEFAULTS))
+def test_get_llm_model_returns_provider_default(provider):
+    s = _settings(provider)
+    assert s.get_llm_model() == PROVIDER_DEFAULTS[provider]["main"]
+
+
+@pytest.mark.parametrize("provider", sorted(_PROVIDERS_WITH_CURATED_DEFAULTS))
+def test_get_chart_llm_model_returns_provider_default(provider):
+    s = _settings(provider)
+    assert s.get_chart_llm_model() == PROVIDER_DEFAULTS[provider]["chart"]
+
+
+@pytest.mark.parametrize("provider", sorted(_PROVIDERS_WITH_CURATED_DEFAULTS))
+def test_get_quality_llm_model_returns_provider_default(provider):
+    s = _settings(provider)
+    assert s.get_quality_llm_model() == PROVIDER_DEFAULTS[provider]["quality"]
+
+
+@pytest.mark.parametrize("provider", sorted(_PROVIDERS_WITH_CURATED_DEFAULTS))
+def test_get_delight_llm_model_returns_provider_default(provider):
+    s = _settings(provider)
+    assert s.get_delight_llm_model() == PROVIDER_DEFAULTS[provider]["delight"]
+
+
+def test_llm_model_env_override_takes_precedence():
+    s = _settings("anthropic", llm_model="claude-opus-custom")
+    assert s.get_llm_model() == "claude-opus-custom"
+
+
+def test_chart_llm_model_env_override_takes_precedence():
+    s = _settings("openai", chart_llm_model="gpt-4o-custom")
+    assert s.get_chart_llm_model() == "gpt-4o-custom"
+
+
+def test_quality_llm_model_env_override_takes_precedence():
+    s = _settings("google", quality_llm_model="gemini-custom")
+    assert s.get_quality_llm_model() == "gemini-custom"
+
+
+def test_delight_llm_model_env_override_takes_precedence():
+    s = _settings("anthropic", delight_llm_model="claude-haiku-custom")
+    assert s.get_delight_llm_model() == "claude-haiku-custom"
+
+
+def test_unknown_provider_falls_back_to_openai_defaults():
+    """Graceful fallback — unknown provider should not raise, returns OpenAI defaults."""
+    s = _settings("unknown-future-provider")
+    assert s.get_llm_model() == PROVIDER_DEFAULTS["openai"]["main"]
+
+
+# ─── Settings._resolve_model — openai-compatible provider fallback ───────────
+
+
+def test_openai_compatible_non_main_tiers_fall_back_to_openai_compatible_model():
+    """For 'openai-compatible', chart/quality/delight use openai_compatible_model when no tier override is set."""
+    s = _settings("openai-compatible", openai_compatible_model="llama3.2:1b")
+    assert s.get_chart_llm_model() == "llama3.2:1b"
+    assert s.get_quality_llm_model() == "llama3.2:1b"
+    assert s.get_delight_llm_model() == "llama3.2:1b"
+
+
+def test_openai_compatible_non_main_tiers_prefer_llm_model_over_openai_compatible_model():
+    """llm_model (the primary override) takes priority over openai_compatible_model for non-main tiers."""
+    s = _settings(
+        "openai-compatible", llm_model="qwen2.5:7b", openai_compatible_model="llama3.2:1b"
+    )
+    assert s.get_chart_llm_model() == "qwen2.5:7b"
+    assert s.get_quality_llm_model() == "qwen2.5:7b"
+    assert s.get_delight_llm_model() == "qwen2.5:7b"
+
+
+def test_openai_compatible_tier_override_wins_over_all_fallbacks():
+    """Per-tier override always beats the openai_compatible_model fallback."""
+    s = _settings(
+        "openai-compatible",
+        chart_llm_model="chart-specific",
+        quality_llm_model="quality-specific",
+        delight_llm_model="delight-specific",
+        openai_compatible_model="fallback",
+    )
+    assert s.get_chart_llm_model() == "chart-specific"
+    assert s.get_quality_llm_model() == "quality-specific"
+    assert s.get_delight_llm_model() == "delight-specific"
+
+
+def test_openai_compatible_main_tier_falls_back_to_openai_compatible_model():
+    """get_llm_model() uses openai_compatible_model when llm_model is unset for the openai-compatible provider."""
+    s = _settings("openai-compatible", openai_compatible_model="llama3.2:1b")
+    assert s.get_llm_model() == "llama3.2:1b"
+
+
+def test_openai_compatible_empty_when_neither_model_set():
+    """All tiers return '' for openai-compatible provider when no models are configured.
+
+    Constructor kwargs take priority over env/.env in Pydantic BaseSettings, so
+    passing empty strings here isolates the test from the user's local .env.
+    """
+    s = _settings("openai-compatible", llm_model="", openai_compatible_model="")
+    assert s.get_llm_model() == ""
+    assert s.get_chart_llm_model() == ""
+    assert s.get_quality_llm_model() == ""
+    assert s.get_delight_llm_model() == ""
+
+
+# ─── Settings.get_api_key ─────────────────────────────────────────────────────
+
+
+def test_get_api_key_anthropic():
+    s = _settings("anthropic", anthropic_api_key="sk-ant-test")
+    assert s.get_api_key() == "sk-ant-test"
+
+
+def test_get_api_key_openai():
+    s = _settings("openai", openai_api_key="sk-oai-test")
+    assert s.get_api_key() == "sk-oai-test"
+
+
+def test_get_api_key_google():
+    s = _settings("google", google_api_key="AIza-test")
+    assert s.get_api_key() == "AIza-test"
+
+
+def test_get_api_key_empty_when_not_set():
+    s = _settings("anthropic")
+    assert s.get_api_key() == ""
+
+
+def test_get_api_key_bedrock_returns_empty():
+    """Bedrock authenticates via AWS credentials, not a single API key."""
+    s = _settings("bedrock")
+    assert s.get_api_key() == ""
+
+
+def test_get_api_key_unknown_provider_returns_empty():
+    s = _settings("mystery-provider")
+    assert s.get_api_key() == ""
+
+
+# ─── agent/llm._FACTORIES registry ───────────────────────────────────────────
+
+
+def test_factories_cover_all_providers():
+    assert set(_FACTORIES) == EXPECTED_PROVIDERS
+
+
+@patch("analytics_agent.agent.llm.settings")
+def test_make_llm_anthropic_calls_correct_factory(mock_settings):
+    mock_settings.llm_provider = "anthropic"
+    fake_llm = MagicMock()
+    mock_factory = MagicMock(return_value=fake_llm)
+    with patch.dict(_FACTORIES, {"anthropic": mock_factory}):
+        result = _make_llm("claude-sonnet-4-6")
+    mock_factory.assert_called_once_with("claude-sonnet-4-6", False)
+    assert result is fake_llm
+
+
+@patch("analytics_agent.agent.llm.settings")
+def test_make_llm_openai_calls_correct_factory(mock_settings):
+    mock_settings.llm_provider = "openai"
+    fake_llm = MagicMock()
+    mock_factory = MagicMock(return_value=fake_llm)
+    with patch.dict(_FACTORIES, {"openai": mock_factory}):
+        result = _make_llm("gpt-4o", streaming=True)
+    mock_factory.assert_called_once_with("gpt-4o", True)
+    assert result is fake_llm
+
+
+@patch("analytics_agent.agent.llm.settings")
+def test_make_llm_google_calls_correct_factory(mock_settings):
+    mock_settings.llm_provider = "google"
+    fake_llm = MagicMock()
+    mock_factory = MagicMock(return_value=fake_llm)
+    with patch.dict(_FACTORIES, {"google": mock_factory}):
+        result = _make_llm("gemini-2.0-flash")
+    mock_factory.assert_called_once_with("gemini-2.0-flash", False)
+    assert result is fake_llm
+
+
+@patch("analytics_agent.agent.llm.settings")
+def test_make_llm_unknown_provider_raises(mock_settings):
+    mock_settings.llm_provider = "mystery-provider"
+
+    with pytest.raises(ValueError, match="Unknown LLM provider"):
+        _make_llm("some-model")
+
+
+@patch("analytics_agent.agent.llm.settings")
+def test_make_llm_error_message_lists_valid_providers(mock_settings):
+    mock_settings.llm_provider = "mystery"
+
+    with pytest.raises(ValueError) as exc_info:
+        _make_llm("some-model")
+
+    msg = str(exc_info.value)
+    for p in EXPECTED_PROVIDERS:
+        assert p in msg
+
+
+# ─── Backward-compatible env var aliases (OPENAI_COMPAT_* → OPENAI_COMPATIBLE_*) ─
+#
+# Pydantic treats an env var set to "" as a found (non-missing) value, so it would
+# shadow the next alias in AliasChoices. Tests therefore use monkeypatch.delenv to
+# fully remove the competing key rather than blanking it.
+
+_ALIAS_PAIRS = [
+    # (old_name, new_name, field_name, sample_value)
+    (
+        "OPENAI_COMPAT_BASE_URL",
+        "OPENAI_COMPATIBLE_BASE_URL",
+        "openai_compatible_base_url",
+        "http://proxy/v1",
+    ),
+    (
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_COMPATIBLE_API_KEY",
+        "openai_compatible_api_key",
+        "sk-test-key",
+    ),
+]
+
+
+def _make_settings(monkeypatch) -> Settings:
+    return Settings(llm_provider="openai-compatible", database_url="sqlite+aiosqlite:///./test.db")
+
+
+@pytest.mark.parametrize("old_name,new_name,field,value", _ALIAS_PAIRS)
+def test_legacy_env_var_is_accepted(monkeypatch, old_name, new_name, field, value):
+    """The pre-rename env var name must still populate its Settings field."""
+    monkeypatch.delenv(new_name, raising=False)
+    monkeypatch.setenv(old_name, value)
+    s = _make_settings(monkeypatch)
+    assert getattr(s, field) == value
+
+
+@pytest.mark.parametrize("old_name,new_name,field,value", _ALIAS_PAIRS)
+def test_new_env_var_is_accepted(monkeypatch, old_name, new_name, field, value):
+    """The current env var name must populate its Settings field."""
+    monkeypatch.delenv(old_name, raising=False)
+    monkeypatch.setenv(new_name, value)
+    s = _make_settings(monkeypatch)
+    assert getattr(s, field) == value
+
+
+@pytest.mark.parametrize("old_name,new_name,field,value", _ALIAS_PAIRS)
+def test_new_env_var_takes_priority_over_legacy(monkeypatch, old_name, new_name, field, value):
+    """When both names are set, the current name (first in AliasChoices) wins."""
+    monkeypatch.setenv(new_name, value)
+    monkeypatch.setenv(old_name, "should-not-appear")
+    s = _make_settings(monkeypatch)
+    assert getattr(s, field) == value
+
+
+# ─── _make_anthropic base_url wiring (PR #80) ────────────────────────────────
+
+
+@patch("langchain_anthropic.ChatAnthropic")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_anthropic_passes_base_url_when_set(mock_settings, mock_chat):
+    """ANTHROPIC_BASE_URL is forwarded to ChatAnthropic as anthropic_api_url."""
+    from analytics_agent.agent.llm import _make_anthropic
+
+    mock_settings.anthropic_api_key = "sk-ant-test"
+    mock_settings.anthropic_base_url = "https://proxy.example.com"
+
+    _make_anthropic("claude-sonnet-4-6", streaming=False)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["anthropic_api_url"] == "https://proxy.example.com"
+    assert kwargs["model_name"] == "claude-sonnet-4-6"
+
+
+@patch("langchain_anthropic.ChatAnthropic")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_anthropic_omits_base_url_when_unset(mock_settings, mock_chat):
+    """Unset base URL means no anthropic_api_url kwarg — default endpoint is used."""
+    from analytics_agent.agent.llm import _make_anthropic
+
+    mock_settings.anthropic_api_key = "sk-ant-test"
+    mock_settings.anthropic_base_url = ""
+
+    _make_anthropic("claude-sonnet-4-6", streaming=False)
+
+    _, kwargs = mock_chat.call_args
+    assert "anthropic_api_url" not in kwargs
+
+
+# ─── _make_openai reasoning-model wiring ─────────────────────────────────────
+
+
+@patch("langchain_openai.ChatOpenAI")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_openai_uses_responses_api_when_reasoning_effort_set(mock_settings, mock_chat):
+    """OPENAI_REASONING_EFFORT switches to the Responses API.
+
+    Reasoning models reject function tools on /v1/chat/completions unless
+    reasoning_effort is "none", so the agent cannot use its tools there at all.
+    """
+    from analytics_agent.agent.llm import _make_openai
+
+    mock_settings.openai_api_key = "sk-oai-test"
+    mock_settings.openai_reasoning_effort = "low"
+
+    _make_openai("gpt-5.1", streaming=False)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["use_responses_api"] is True
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["model"] == "gpt-5.1"
+
+
+@patch("langchain_openai.ChatOpenAI")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_openai_drops_temperature_for_reasoning_models(mock_settings, mock_chat):
+    """Reasoning models accept only the default temperature and 400 on temperature=0."""
+    from analytics_agent.agent.llm import _make_openai
+
+    mock_settings.openai_api_key = "sk-oai-test"
+    mock_settings.openai_reasoning_effort = "medium"
+
+    _make_openai("gpt-5.1", streaming=False)
+
+    _, kwargs = mock_chat.call_args
+    assert "temperature" not in kwargs
+
+
+@patch("langchain_openai.ChatOpenAI")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_openai_unchanged_when_reasoning_effort_unset(mock_settings, mock_chat):
+    """Unset effort leaves the existing chat-completions path exactly as it was."""
+    from analytics_agent.agent.llm import _make_openai
+
+    mock_settings.openai_api_key = "sk-oai-test"
+    mock_settings.openai_reasoning_effort = ""
+
+    _make_openai("gpt-4o", streaming=True)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["temperature"] == 0
+    assert "use_responses_api" not in kwargs
+    assert "reasoning_effort" not in kwargs
+
+
+@patch("langchain_openai.ChatOpenAI")
+@patch("analytics_agent.agent.llm.settings")
+def test_make_openai_skips_reasoning_effort_for_non_reasoning_model(mock_settings, mock_chat):
+    """A global effort must NOT be applied to non-reasoning models (e.g. the
+    chart/quality/delight tiers on gpt-4o-mini), which 400 on reasoning.effort."""
+    from analytics_agent.agent.llm import _make_openai
+
+    mock_settings.openai_api_key = "sk-oai-test"
+    mock_settings.openai_reasoning_effort = "low"  # set globally...
+
+    _make_openai("gpt-4o-mini", streaming=False)  # ...but this tier isn't a reasoning model
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["temperature"] == 0
+    assert "use_responses_api" not in kwargs
+    assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("gpt-5.1", True),
+        ("gpt-5", True),
+        ("o1", True),
+        ("o3-mini", True),
+        ("o4-mini", True),
+        ("gpt-4o", False),
+        ("gpt-4o-mini", False),
+        ("gpt-3.5-turbo", False),
+    ],
+)
+def test_is_openai_reasoning_model(model, expected):
+    from analytics_agent.agent.llm import _is_openai_reasoning_model
+
+    assert _is_openai_reasoning_model(model) is expected

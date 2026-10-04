@@ -1,0 +1,47 @@
+*.env
+!.env.example
+.env.quickstart
+config.yaml
+!config.yaml.example
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+data/
+*.db
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+backend/src/analytics_agent/static/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+nohup.out
+
+# Playwright test artifacts
+.playwright-mcp/
+*.png
+# Playwright default output dir (traces, .last-run.json)
+test-results/
+# Personal dev configs pointing at an already-running server
+tests/e2e/*.local.config.ts
+
+# Claude Code session state (local-only)
+.claude/
+
+# Git credentials (written by DataHub agent tooling for auth; never commit)
+.git-credentials
